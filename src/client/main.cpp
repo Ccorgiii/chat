@@ -22,6 +22,10 @@ using json = nlohmann::json;
 #include "user.hpp"
 #include "public.hpp"
 
+#include <fstream>
+#include <sys/stat.h>   // 用于创建目录
+#include <unistd.h>     // readlink
+#include <limits.h>     // PATH_MAX
 /*
 几个可以完善的地方
 1.login过程中 输入id输入string导致缓冲区失效了 [已修改]
@@ -53,6 +57,68 @@ sem_t rwsem;
 // 记录登录状态
 atomic_bool g_isLoginSuccess{false};
 
+// 记录存储历史消息的位置
+static string basedir;
+//#define PATH_MAX 100
+
+// 获取执行文件路径
+std::string getExePath(){
+    char result[PATH_MAX];
+    ssize_t count = readlink("/proc/self/exe",result,PATH_MAX);
+    if(count != -1){
+        result[count] = 0;
+        return std::string(result);
+    }
+    return "";
+}
+std::string getBaseDir(){
+    std::string exepath = getExePath();
+    std::string::size_type pos = exepath.find_last_of("/\\");
+    if(pos != std::string::npos){
+        exepath = exepath.substr(0,pos);
+    }
+    pos = exepath.find_last_of("/\\");
+    if(pos != std::string::npos){
+        exepath = exepath.substr(0,pos);
+    }
+    return exepath + "/history";
+}
+// 创建目录
+bool createdirectory(const std::string& dirpath){
+    struct stat st;
+    // 目录已经存在
+    if(stat(dirpath.c_str(),&st)!= -1){
+        return true;
+    }
+    //else{
+    // 创建目录 0777 所有者/所属组/其他用户 有 读/写/执行 权限
+        return mkdir(dirpath.c_str(),0777) == 0;
+    //}
+}
+// 保存发送和接受的消息 根据id号存储
+void savemessage(const std::string& str,const int&id,const std::string& base){
+
+    // 创建文件夹路径
+    std::string dir = base + "/" + std::to_string(id);
+    std::string firepath = dir +"/"+ "chat_history.txt";
+    //std::cout << "dir:"<<dir<<std::endl;
+    //std::cout << "firepath:"<<firepath<<std::endl;
+    if(!createdirectory(dir)){
+        std::cout << "Failed to create directory for id:"<< id << std::endl;
+        return;
+    }
+
+    // 以追加模式打开文件
+    std::ofstream file(firepath,std::ios::out | std::ios::app);
+    if(file.is_open()){
+        file << str << std::endl; // 写入消息并添加换行符
+        file.close();
+    }
+    else{
+        std::cerr << "Unable to open file for writing." << std::endl;
+    }
+
+}
 
 // 接收线程
 void readTaskHandler(int clientfd);
@@ -107,6 +173,8 @@ int main(int argc, char **argv)
     std::thread readTask(readTaskHandler, clientfd); // pthread_create
     readTask.detach();                               // pthread_detach
 
+    basedir = getBaseDir();
+    //std::cout << "basedir:"<<basedir<<endl;
     // main线程用于接收用户输入，负责发送数据
     for (;;)
     {
@@ -170,6 +238,10 @@ int main(int argc, char **argv)
                 
             if (g_isLoginSuccess) 
             {
+                // 对应用户id本地创建消息文件夹
+                basedir += "/"+to_string(id);
+                createdirectory(basedir);
+                
                 // 进入聊天主菜单页面
                 isMainMenuRunning = true;
                 mainMenu(clientfd);
@@ -419,6 +491,8 @@ void groupchat(int, string);
 // "loginout" command handler
 void loginout(int, string);
 
+void history(int,string);
+
 // 系统支持的客户端命令列表
 unordered_map<string, string> commandMap = {
     {"help", "显示所有支持的命令，格式help"},
@@ -427,7 +501,8 @@ unordered_map<string, string> commandMap = {
     {"creategroup", "创建群组，格式creategroup:groupname:groupdesc"},
     {"addgroup", "加入群组，格式addgroup:groupid"},
     {"groupchat", "群聊，格式groupchat:groupid:message"},
-    {"loginout", "注销，格式loginout"}};
+    {"loginout", "注销，格式loginout"},
+    {"history","历史消息，格式history:friendid"}};
 
 // 注册系统支持的客户端命令处理
 unordered_map<string, function<void(int, string)>> commandHandlerMap = {
@@ -437,7 +512,8 @@ unordered_map<string, function<void(int, string)>> commandHandlerMap = {
     {"creategroup", creategroup},
     {"addgroup", addgroup},
     {"groupchat", groupchat},
-    {"loginout", loginout}};
+    {"loginout", loginout},
+    {"history",history}};
 
 // 主聊天页面程序
 void mainMenu(int clientfd)
@@ -509,14 +585,14 @@ void chat(int clientfd, string str)
 
     int friendid = atoi(str.substr(0, idx).c_str());
     string message = str.substr(idx + 1, str.size() - idx);
-
+    string time = getCurrentTime();
     json js;
     js["msgid"] = ONE_CHAT_MSG;
     js["id"] = g_currentUser.getId();
     js["name"] = g_currentUser.getName();
     js["toid"] = friendid;
     js["msg"] = message;
-    js["time"] = getCurrentTime();
+    js["time"] = time;
     string buffer = js.dump();
 
     int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
@@ -524,7 +600,10 @@ void chat(int clientfd, string str)
     {
         cerr << "send chat msg error -> " << buffer << endl;
     }
+    savemessage(time + ":"+ message,friendid,basedir);
+
 }
+
 // "creategroup" command handler  groupname:groupdesc
 void creategroup(int clientfd, string str)
 {
@@ -613,7 +692,27 @@ void loginout(int clientfd, string)
         isMainMenuRunning = false;
     }   
 }
+// "history" command handler 
+void history(int clientfd, string str){
+    
+    int friendid = atoi(str.c_str());
+    int userid = g_currentUser.getId();
 
+    // 创建文件路径
+    std::string filepath = basedir + "/" + std::to_string(friendid)+ "/"+ "chat_history.txt";
+    std::cout << "basedir:" <<basedir<<std::endl;
+    std::ifstream file(filepath);
+    if(!file.is_open()){
+        std::cerr << "Unable to open file:" << filepath<<std::endl;
+        return;
+    }
+    std::string line;
+    while(std::getline(file,line)){
+        std::cout<<line<<std::endl;
+    }
+    file.close();
+
+}
 // 获取系统时间（聊天信息需要添加时间信息）
 string getCurrentTime()
 {
